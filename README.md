@@ -1,0 +1,1 @@
+This script trains a lightweight 3D UNet on NIfTI medical images by extracting normalized patches from a small subset of patients, using Dice loss and mixed-precision training, and saves model checkpoints after each epoch.
