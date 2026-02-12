@@ -1,3 +1,5 @@
 __pycache__/
 venv_gpu/
 data/
+test.py
+learn.py

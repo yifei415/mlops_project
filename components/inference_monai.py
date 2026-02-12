@@ -8,6 +8,7 @@ import nibabel as nib
 from monai.networks.nets import UNet
 from monai.inferers import sliding_window_inference
 from monai.networks.nets import DynUNet
+from scipy.ndimage import label
 #from monai.networks.nets import ResUNet
 
 class ResidualBlock3D(nn.Module):
@@ -71,7 +72,7 @@ def load_resunet(device='cpu', checkpoint_path=None):
 
 def load_dynunet(device='cpu', checkpoint_path=None):
     """
-    轻量版 DynUNet 3D，用于测试 / 对比
+    轻量版 DynUNet 3D, 用于测试 / 对比
     """
     model = DynUNet(
         spatial_dims=3,
@@ -115,7 +116,7 @@ def load_monai_unet(device='cpu', checkpoint_path=None):
         spatial_dims=3,
         in_channels=1,
         out_channels=1,
-        channels=(8, 16, 32),
+        channels=(16, 32, 64),
         #channels=(16, 32, 64, 128),
         strides=(2, 2),
     ).to(device)
@@ -134,37 +135,84 @@ def load_monai_unet(device='cpu', checkpoint_path=None):
 # ---------------------------
 # 单病例 NIfTI 推理
 # ---------------------------
-def inference_from_nii(nii_path, model, device='cpu', threshold=0.5):
+def inference_from_nii_clean(
+    nii_path,
+    model,
+    device="cpu",
+    threshold=0.5,
+    min_size=100,
+    roi_size=(64, 64, 64),
+    overlap=0.25
+):
     """
-    nii_path: CT volume path (.nii.gz)
-    model: MONAI UNet
+    3D UNet Safe Inference with:
+    - Volume padding to match model downsampling
+    - Sliding window inference
+    - Sigmoid threshold
+    - Connected component filtering
     """
-
-
     nii_path = Path(nii_path)
+
+    # ---------- Load ----------
     img = nib.load(str(nii_path)).get_fdata().astype(np.float32)
+    print("Original volume shape:", img.shape)
 
-    img = img[:, :, :8]
-    #img = img[:, :, :8]  # 只取 8 张 slice
-    print("Test slice shape:", img.shape)
+    # ---------- Normalize ----------
+    img = (img - img.min()) / (img.max() - img.min() + 1e-8)
 
-    # 归一化
-    img = (img - img.min()) / (img.max() - img.min())
+    # ---------- Pad to be multiple of UNet downsampling (16 for 3 levels) ----------
+    def pad_to_multiple(vol, multiple=16):
+        z, y, x = vol.shape
+        pad_z = (multiple - z % multiple) % multiple
+        pad_y = (multiple - y % multiple) % multiple
+        pad_x = (multiple - x % multiple) % multiple
+        vol_padded = np.pad(vol,
+                            ((0, pad_z), (0, pad_y), (0, pad_x)),
+                            mode='constant')
+        return vol_padded, (z, y, x)
+    
+    img, orig_shape = pad_to_multiple(img, multiple=16)
+    print("Padded volume shape:", img.shape)
 
-    # 转为 tensor
-    x = torch.tensor(img[None, None, ...]).to(device)
+    # ---------- To tensor ----------
+    x = torch.from_numpy(img[None, None, ...]).to(device)
 
-    # 推理
+    # ---------- Sliding window inference ----------
+    model.eval()
     with torch.no_grad():
-        pred = sliding_window_inference(x, roi_size=(128, 128, 16), sw_batch_size=1, predictor=model, overlap=0.1)
-    pred_mask = (pred.cpu().numpy()[0, 0] > threshold).astype(np.uint8)
+        logits = sliding_window_inference(
+            x,
+            roi_size=roi_size,
+            sw_batch_size=1,
+            predictor=model,
+            overlap=overlap,
+        )
+        probs = torch.sigmoid(logits)[0,0].cpu().numpy()
 
-    # bbox
-    bboxes = mask_to_bboxes(pred_mask)
+    # ---------- Threshold ----------
+    pred_mask = (probs > threshold).astype(np.uint8)
+
+    # ---------- Connected component filtering ----------
+    labeled, num = label(pred_mask)
+    clean_mask = np.zeros_like(pred_mask, dtype=np.uint8)
+    for i in range(1, num+1):
+        comp = (labeled == i)
+        if comp.sum() >= min_size:
+            clean_mask[comp] = 1
+
+    # ---------- Crop back to original shape ----------
+    z, y, x = orig_shape
+    clean_mask = clean_mask[:z, :y, :x]
+
+    # ---------- BBoxes ----------
+    bboxes = mask_to_bboxes(clean_mask)
+
+    print(f"Predicted objects: {len(bboxes)}, sum of voxels: {clean_mask.sum()}")
 
     return {
-        'pred_mask': pred_mask,
-        'bboxes': bboxes
+        "pred_mask": clean_mask,
+        "bboxes": bboxes,
+        "num_objects": len(bboxes)
     }
 
 # ---------------------------
